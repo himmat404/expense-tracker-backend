@@ -150,6 +150,8 @@ const updateGroup = async (req, res) => {
 // @desc    Add member to group (existing user or pending)
 // @route   POST /api/groups/:id/members
 // @access  Private
+// REPLACE addMember function in groupController.js
+
 const addMember = async (req, res) => {
     try {
         const { userId, email, name } = req.body;
@@ -164,10 +166,12 @@ const addMember = async (req, res) => {
             return res.status(403).json({ message: 'Not authorized' });
         }
 
+        let addedUserId = null;
+
         // Case 1: Adding existing user by userId
         if (userId) {
             // Check if user exists
-            const user = await User.findById(userId);
+            const user = await User.findOne({ _id: userId });
             if (!user) {
                 return res.status(404).json({ message: 'User not found' });
             }
@@ -179,9 +183,23 @@ const addMember = async (req, res) => {
 
             group.members.push(userId);
             await group.save();
+            addedUserId = userId;
 
             // Check if this user was a pending member and convert their expenses
             await convertPendingMemberExpenses(group._id, user.email, userId);
+
+            // 🆕 Create notification for added member
+            await Notification.create({
+                recipient: userId,
+                sender: req.user._id,
+                type: 'GROUP_INVITE',
+                message: `${req.user.name} added you to group "${group.name}"`,
+                relatedId: group._id,
+                relatedModel: 'Group',
+                metadata: { groupName: group.name }
+            });
+
+            console.log(`✅ Notification sent to ${user.name}`);
         } 
         // Case 2: Adding pending member by email
         else if (email && name) {
@@ -193,6 +211,18 @@ const addMember = async (req, res) => {
                     return res.status(400).json({ message: 'User is already a member' });
                 }
                 group.members.push(existingUser._id);
+                addedUserId = existingUser._id;
+
+                // 🆕 Create notification
+                await Notification.create({
+                    recipient: existingUser._id,
+                    sender: req.user._id,
+                    type: 'GROUP_INVITE',
+                    message: `${req.user.name} added you to group "${group.name}"`,
+                    relatedId: group._id,
+                    relatedModel: 'Group',
+                    metadata: { groupName: group.name }
+                });
             } else {
                 // Check if already in pending members
                 const alreadyPending = group.pendingMembers.some(
@@ -221,6 +251,8 @@ const addMember = async (req, res) => {
                     },
                     { upsert: true, new: true }
                 );
+
+                console.log(`📧 Pending invitation created for ${email}`);
             }
 
             await group.save();
