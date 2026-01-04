@@ -5,6 +5,7 @@ const Group = require('../models/Group');
 const Expense = require('../models/Expense');
 const User = require('../models/User');
 const PendingMember = require('../models/PendingMember');
+const Notification = require('../models/Notification');
 
 // Helper function to convert pending member expenses
 const convertPendingMemberExpenses = async (groupId, email, userId) => {
@@ -155,14 +156,19 @@ const updateGroup = async (req, res) => {
 const addMember = async (req, res) => {
     try {
         const { userId, email, name } = req.body;
+        
+        console.log('📥 Add member request:', { userId, email, name, groupId: req.params.id });
+        
         const group = await Group.findById(req.params.id);
 
         if (!group) {
+            console.error('❌ Group not found:', req.params.id);
             return res.status(404).json({ message: 'Group not found' });
         }
 
         // Check if requester is a member
         if (!group.members.includes(req.user._id)) {
+            console.error('❌ User not authorized:', req.user._id);
             return res.status(403).json({ message: 'Not authorized' });
         }
 
@@ -170,14 +176,19 @@ const addMember = async (req, res) => {
 
         // Case 1: Adding existing user by userId
         if (userId) {
-            // Check if user exists
-            const user = await User.findOne({ _id: userId });
+            console.log('🔍 Looking up user:', userId);
+            
+            const user = await User.findById(userId);
             if (!user) {
+                console.error('❌ User not found:', userId);
                 return res.status(404).json({ message: 'User not found' });
             }
 
+            console.log('✅ Found user:', user.name, user.email);
+
             // Check if user is already a member
-            if (group.members.includes(userId)) {
+            if (group.members.some(m => m.toString() === userId)) {
+                console.log('⚠️ User already a member');
                 return res.status(400).json({ message: 'User is already a member' });
             }
 
@@ -185,37 +196,19 @@ const addMember = async (req, res) => {
             await group.save();
             addedUserId = userId;
 
-            // Check if this user was a pending member and convert their expenses
-            await convertPendingMemberExpenses(group._id, user.email, userId);
+            console.log('✅ Added user to group');
 
-            // 🆕 Create notification for added member
-            await Notification.create({
-                recipient: userId,
-                sender: req.user._id,
-                type: 'GROUP_INVITE',
-                message: `${req.user.name} added you to group "${group.name}"`,
-                relatedId: group._id,
-                relatedModel: 'Group',
-                metadata: { groupName: group.name }
-            });
+            // Convert pending expenses
+            try {
+                await convertPendingMemberExpenses(group._id, user.email, userId);
+            } catch (error) {
+                console.error('⚠️ Error converting expenses:', error.message);
+            }
 
-            console.log(`✅ Notification sent to ${user.name}`);
-        } 
-        // Case 2: Adding pending member by email
-        else if (email && name) {
-            // Check if user already exists with this email
-            const existingUser = await User.findOne({ email: email.toLowerCase() });
-            if (existingUser) {
-                // If user exists, add them directly
-                if (group.members.includes(existingUser._id)) {
-                    return res.status(400).json({ message: 'User is already a member' });
-                }
-                group.members.push(existingUser._id);
-                addedUserId = existingUser._id;
-
-                // 🆕 Create notification
+            // Create notification
+            try {
                 await Notification.create({
-                    recipient: existingUser._id,
+                    recipient: userId,
                     sender: req.user._id,
                     type: 'GROUP_INVITE',
                     message: `${req.user.name} added you to group "${group.name}"`,
@@ -223,12 +216,51 @@ const addMember = async (req, res) => {
                     relatedModel: 'Group',
                     metadata: { groupName: group.name }
                 });
+                console.log('✅ Notification created');
+            } catch (error) {
+                console.error('⚠️ Error creating notification:', error.message);
+            }
+        } 
+        // Case 2: Adding pending member by email
+        else if (email && name) {
+            console.log('📧 Adding pending member:', email);
+            
+            // Check if user already exists with this email
+            const existingUser = await User.findOne({ email: email.toLowerCase() });
+            
+            if (existingUser) {
+                console.log('✅ Found existing user for email:', existingUser.name);
+                
+                // If user exists, add them directly
+                if (group.members.some(m => m.toString() === existingUser._id.toString())) {
+                    return res.status(400).json({ message: 'User is already a member' });
+                }
+                
+                group.members.push(existingUser._id);
+                addedUserId = existingUser._id;
+
+                // Create notification
+                try {
+                    await Notification.create({
+                        recipient: existingUser._id,
+                        sender: req.user._id,
+                        type: 'GROUP_INVITE',
+                        message: `${req.user.name} added you to group "${group.name}"`,
+                        relatedId: group._id,
+                        relatedModel: 'Group',
+                        metadata: { groupName: group.name }
+                    });
+                } catch (error) {
+                    console.error('⚠️ Error creating notification:', error.message);
+                }
             } else {
                 // Check if already in pending members
                 const alreadyPending = group.pendingMembers.some(
                     pm => pm.email.toLowerCase() === email.toLowerCase()
                 );
+                
                 if (alreadyPending) {
+                    console.log('⚠️ Email already in pending members');
                     return res.status(400).json({ message: 'User is already invited' });
                 }
 
@@ -241,22 +273,27 @@ const addMember = async (req, res) => {
                 });
 
                 // Create/Update PendingMember record
-                await PendingMember.findOneAndUpdate(
-                    { email: email.toLowerCase() },
-                    {
-                        email: email.toLowerCase(),
-                        name,
-                        invitedBy: req.user._id,
-                        $addToSet: { groups: group._id }
-                    },
-                    { upsert: true, new: true }
-                );
-
-                console.log(`📧 Pending invitation created for ${email}`);
+                try {
+                    await PendingMember.findOneAndUpdate(
+                        { email: email.toLowerCase() },
+                        {
+                            email: email.toLowerCase(),
+                            name,
+                            invitedBy: req.user._id,
+                            $addToSet: { groups: group._id }
+                        },
+                        { upsert: true, new: true }
+                    );
+                    console.log('✅ Pending member record created');
+                } catch (error) {
+                    console.error('⚠️ Error creating pending member:', error.message);
+                }
             }
 
             await group.save();
+            console.log('✅ Group saved');
         } else {
+            console.error('❌ Invalid request body');
             return res.status(400).json({ 
                 message: 'Please provide either userId or both email and name' 
             });
@@ -267,9 +304,16 @@ const addMember = async (req, res) => {
             .populate('createdBy', 'name email')
             .populate('pendingMembers.invitedBy', 'name email');
 
+        console.log('✅ Member added successfully');
         res.json(populatedGroup);
+        
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error('❌ Error in addMember:', error);
+        console.error('Stack trace:', error.stack);
+        res.status(500).json({ 
+            message: error.message,
+            error: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
     }
 };
 
